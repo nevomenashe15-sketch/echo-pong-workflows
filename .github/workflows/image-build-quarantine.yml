@@ -1,0 +1,239 @@
+# Reusable multi-architecture image build -> QUARANTINE registry.
+#
+# CONTRACT: this workflow PUBLISHES an image; it does NOT approve one.
+# The manifest list produced here lands in the short-lived `echo-pong-quarantine`
+# ECR repository (and, optionally, in GHCR to satisfy the app repo's own
+# "images stored in GitHub Container Registry" deliverable). Nothing downstream
+# may treat a digest emitted here as production-ready until image-scan.yml has
+# passed and image-promote.yml has copied it into the production repository.
+#
+# ARCHITECTURE STRATEGY: linux/amd64 + linux/arm64 built on a single amd64
+# GitHub-hosted runner using QEMU (docker/setup-qemu-action). This is nearly
+# free for this specific app: echo-pong's Dockerfile pins its build stage to
+# `--platform=$BUILDPLATFORM` and cross-compiles with GOOS/GOARCH, so the
+# compute-heavy Go compile always runs natively and only the final-stage COPY
+# into distroless executes under emulation. Native arm64 runners remain a
+# documented future optimisation, not a present need.
+#
+# AWS ACCESS: GitHub OIDC only. No static access keys, no hardcoded account ID
+# or ECR hostname anywhere in this file -- the registry host is discovered from
+# the amazon-ecr-login action's output, and the role ARN arrives as an input
+# supplied by the caller from its own vars/secrets.
+name: Reusable multi-arch image build (quarantine)
+
+on:
+  workflow_call:
+    inputs:
+      aws-region:
+        type: string
+        required: true
+        description: "AWS region hosting the ECR repositories."
+      aws-role-to-assume:
+        type: string
+        required: true
+        description: >-
+          Full ARN of the `echo-pong-gh-ecr-release` IAM role, provisioned by
+          echo-pong-infrastructure. Pass it from a repository/organisation
+          variable or secret in the caller; never hardcode it here.
+      ecr-quarantine-repository:
+        type: string
+        default: "echo-pong-quarantine"
+        description: "ECR repository name (not URI) that receives the untrusted build."
+      dockerfile:
+        type: string
+        default: "Dockerfile"
+      context:
+        type: string
+        default: "."
+      platforms:
+        type: string
+        default: "linux/amd64,linux/arm64"
+        description: "Comma-separated buildx target platforms."
+      image-tag:
+        type: string
+        default: ""
+        description: >-
+          Immutable tag applied in quarantine. Defaults to the full commit SHA.
+          Never pass a mutable tag such as `latest`: both ECR repositories have
+          tag immutability enabled and downstream jobs address images by digest.
+      push-ghcr:
+        type: boolean
+        default: true
+        description: >-
+          Also push the same manifest list to GHCR in the same buildx
+          invocation, so both registries hold byte-identical content under one
+          digest. Requires `packages: write` from the CALLING workflow.
+      ghcr-image-name:
+        type: string
+        default: ""
+        description: "Untagged GHCR ref. Defaults to ghcr.io/<calling repository>."
+      build-args:
+        type: string
+        default: ""
+        description: "Newline-separated additional --build-arg values."
+      runs-on:
+        type: string
+        default: "ubuntu-latest"
+    outputs:
+      image-digest:
+        description: "Digest of the pushed MANIFEST LIST (sha256:...). The handle every downstream workflow uses."
+        value: ${{ jobs.build.outputs.image-digest }}
+      quarantine-image-ref:
+        description: "Fully qualified quarantine ref pinned by digest: <registry>/<repo>@sha256:..."
+        value: ${{ jobs.build.outputs.quarantine-image-ref }}
+      quarantine-repository-uri:
+        description: "Quarantine repository URI without any tag or digest."
+        value: ${{ jobs.build.outputs.quarantine-repository-uri }}
+      ghcr-image-ref:
+        description: "GHCR ref pinned by the same digest, or empty when push-ghcr is false."
+        value: ${{ jobs.build.outputs.ghcr-image-ref }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and push to quarantine
+    runs-on: ${{ inputs.runs-on }}
+    # id-token/packages are granted ONLY on this job -- the workflow-level
+    # ceiling above stays contents:read. The calling workflow must grant the
+    # same three scopes or these steps fail hard rather than skipping.
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+    outputs:
+      image-digest: ${{ steps.push.outputs.digest }}
+      quarantine-image-ref: ${{ steps.refs.outputs.quarantine-repo }}@${{ steps.push.outputs.digest }}
+      quarantine-repository-uri: ${{ steps.refs.outputs.quarantine-repo }}
+      ghcr-image-ref: ${{ steps.digests.outputs.ghcr-digest-ref }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # QEMU registers binfmt handlers so buildx can emulate linux/arm64.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.aws-role-to-assume }}
+          aws-region: ${{ inputs.aws-region }}
+          role-session-name: gh-echo-pong-build-${{ github.run_id }}
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Log in to GHCR
+        if: ${{ inputs.push-ghcr }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve image references
+        id: refs
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+          QUARANTINE_REPO_NAME: ${{ inputs.ecr-quarantine-repository }}
+          GHCR_IMAGE_NAME: ${{ inputs.ghcr-image-name }}
+          PUSH_GHCR: ${{ inputs.push-ghcr }}
+          IMAGE_TAG: ${{ inputs.image-tag }}
+        run: |
+          set -euo pipefail
+          quarantine_repo="${ECR_REGISTRY}/${QUARANTINE_REPO_NAME}"
+          tag="${IMAGE_TAG:-${GITHUB_SHA}}"
+
+          ghcr_repo=""
+          if [ "${PUSH_GHCR}" = "true" ]; then
+            ghcr_repo="${GHCR_IMAGE_NAME:-ghcr.io/${GITHUB_REPOSITORY}}"
+            # GHCR rejects uppercase path segments; repository names may contain them.
+            ghcr_repo="$(printf '%s' "${ghcr_repo}" | tr '[:upper:]' '[:lower:]')"
+          fi
+
+          # One newline-separated tag list drives a single buildx push, so both
+          # registries receive the same manifest list under the same digest.
+          tag_list="${quarantine_repo}:${tag}"
+          if [ -n "${ghcr_repo}" ]; then
+            tag_list="${tag_list}"$'\n'"${ghcr_repo}:${tag}"
+          fi
+
+          {
+            echo "quarantine-repo=${quarantine_repo}"
+            echo "ghcr-repo=${ghcr_repo}"
+            echo "image-tag=${tag}"
+            echo "tags<<EOF"
+            echo "${tag_list}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Derive OCI labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.refs.outputs.quarantine-repo }}
+          tags: type=raw,value=${{ steps.refs.outputs.image-tag }}
+
+      - name: Build and push manifest list
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          platforms: ${{ inputs.platforms }}
+          push: true
+          tags: ${{ steps.refs.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          build-args: ${{ inputs.build-args }}
+          # Build-time SLSA provenance. `sbom` is deliberately left off: the SBOM
+          # is produced per architecture by image-scan.yml with Syft, which sees
+          # the same digests the scanner sees. Both provenance and SBOM
+          # attestations would otherwise appear in the index as extra
+          # `unknown/unknown` manifests that the scan job must filter out.
+          provenance: mode=max
+          sbom: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Resolve digest-pinned references
+        id: digests
+        env:
+          GHCR_REPO: ${{ steps.refs.outputs.ghcr-repo }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          if [ -n "${GHCR_REPO}" ]; then
+            echo "ghcr-digest-ref=${GHCR_REPO}@${DIGEST}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ghcr-digest-ref=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Summarise
+        env:
+          QUARANTINE_REPO: ${{ steps.refs.outputs.quarantine-repo }}
+          GHCR_REF: ${{ steps.digests.outputs.ghcr-digest-ref }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+          PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          {
+            echo "### Quarantine build"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Platforms | \`${PLATFORMS}\` (arm64 via QEMU) |"
+            echo "| Manifest-list digest | \`${DIGEST}\` |"
+            echo "| Quarantine ref | \`${QUARANTINE_REPO}@${DIGEST}\` |"
+            echo "| GHCR ref | \`${GHCR_REF:-not pushed}\` |"
+            echo ""
+            echo "> This image is **not approved**. It is untrusted until"
+            echo "> \`image-scan.yml\` passes and \`image-promote.yml\` copies it"
+            echo "> into the production repository."
+          } >> "$GITHUB_STEP_SUMMARY"

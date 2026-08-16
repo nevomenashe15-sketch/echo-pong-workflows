@@ -1,0 +1,212 @@
+# Reusable binary release: cross-compiled Go binaries attached to a GitHub Release.
+#
+# Kept SEPARATE from image-build-quarantine.yml on purpose. The two produce
+# different artefacts for different consumers on different triggers: container
+# images are built on every qualifying commit and flow through the
+# quarantine/scan/promote pipeline into Kubernetes, whereas binaries are cut
+# only on a version tag and are consumed by humans and CI runners directly.
+# Folding them together would couple a tag-triggered human-facing release to a
+# commit-triggered deployment pipeline and force one to inherit the other's
+# permissions -- `contents: write` is needed here to publish a Release and is
+# exactly what the image path must never hold.
+#
+# MATRIX: linux/amd64 and linux/arm64 mirror the container targets (and the
+# cluster's Graviton preference). darwin/arm64 is included because operators
+# run this locally on Apple Silicon. darwin/amd64 and windows are omitted:
+# no stated consumer, and every extra target is another artefact to sign,
+# publish and support. Add via the `platforms` input if that changes -- no
+# workflow edit required.
+name: Reusable binary release
+
+on:
+  workflow_call:
+    inputs:
+      go-version:
+        type: string
+        default: "1.24"
+      binary-name:
+        type: string
+        default: "ping-pong-game"
+      working-directory:
+        type: string
+        default: "."
+      platforms:
+        type: string
+        default: '["linux/amd64","linux/arm64","darwin/arm64"]'
+        description: "JSON array of GOOS/GOARCH targets."
+      version:
+        type: string
+        default: ""
+        description: "Release version. Defaults to the triggering tag (github.ref_name)."
+      sign-checksums:
+        type: boolean
+        default: true
+        description: >-
+          Cosign keyless signature over the checksum file. Signing the manifest
+          rather than each binary is deliberate: the checksums file already
+          commits to every artefact's content, so one signature covers the whole
+          release and verification stays a two-step check anyone can perform.
+      draft:
+        type: boolean
+        default: false
+      generate-release-notes:
+        type: boolean
+        default: true
+      runs-on:
+        type: string
+        default: "ubuntu-latest"
+    outputs:
+      release-url:
+        description: "URL of the published GitHub Release."
+        value: ${{ jobs.publish.outputs.release-url }}
+      version:
+        description: "Version string used for this release."
+        value: ${{ jobs.publish.outputs.version }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: ${{ fromJSON(inputs.platforms) }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.go-version }}
+          cache: false
+
+      - name: Cross-compile
+        id: build
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          BINARY_NAME: ${{ inputs.binary-name }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          goos="${PLATFORM%%/*}"
+          goarch="${PLATFORM##*/}"
+          version="${VERSION:-${GITHUB_REF_NAME}}"
+          artifact="${BINARY_NAME}_${version}_${goos}_${goarch}"
+
+          # Same flags as the Dockerfile's build stage: CGO off for a static
+          # binary, -trimpath so paths from this runner do not leak into the
+          # binary and so builds are reproducible across machines.
+          CGO_ENABLED=0 GOOS="${goos}" GOARCH="${goarch}" \
+            go build -trimpath -ldflags="-s -w" -o "dist/${artifact}" .
+
+          ( cd dist && sha256sum "${artifact}" > "${artifact}.sha256" )
+          echo "artifact=${artifact}" >> "$GITHUB_OUTPUT"
+          ls -l dist/
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ steps.build.outputs.artifact }}
+          path: ${{ inputs.working-directory }}/dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish release
+    needs: build
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      # Required to create the Release and upload assets.
+      contents: write
+      # Required for Cosign keyless (Fulcio OIDC).
+      id-token: write
+    outputs:
+      release-url: ${{ steps.release.outputs.url }}
+      version: ${{ steps.collect.outputs.version }}
+    steps:
+      - name: Download all binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          path: dist
+          merge-multiple: true
+
+      - name: Build combined checksum manifest
+        id: collect
+        env:
+          VERSION: ${{ inputs.version }}
+          BINARY_NAME: ${{ inputs.binary-name }}
+        run: |
+          set -euo pipefail
+          version="${VERSION:-${GITHUB_REF_NAME}}"
+          cd dist
+          # Drop the per-artifact .sha256 files; one signed manifest replaces them.
+          rm -f ./*.sha256
+          sha256sum ./* | sed 's| \./| |' > "${BINARY_NAME}_${version}_checksums.txt"
+          cat "${BINARY_NAME}_${version}_checksums.txt"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "checksums=dist/${BINARY_NAME}_${version}_checksums.txt" >> "$GITHUB_OUTPUT"
+
+      - name: Install Cosign
+        if: ${{ inputs.sign-checksums }}
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign checksum manifest (keyless)
+        if: ${{ inputs.sign-checksums }}
+        env:
+          CHECKSUMS: ${{ steps.collect.outputs.checksums }}
+        run: |
+          set -euo pipefail
+          # Signature + certificate are published as release assets so anyone can
+          # verify offline-ish against Rekor without a key exchange.
+          cosign sign-blob --yes \
+            --output-signature "${CHECKSUMS}.sig" \
+            --output-certificate "${CHECKSUMS}.pem" \
+            "${CHECKSUMS}"
+
+      - name: Publish GitHub Release
+        id: release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.collect.outputs.version }}
+          draft: ${{ inputs.draft }}
+          generate_release_notes: ${{ inputs.generate-release-notes }}
+          fail_on_unmatched_files: true
+          files: |
+            dist/*
+
+      - name: Summarise
+        env:
+          VERSION: ${{ steps.collect.outputs.version }}
+          PLATFORMS: ${{ inputs.platforms }}
+          URL: ${{ steps.release.outputs.url }}
+          SIGNED: ${{ inputs.sign-checksums }}
+          BINARY_NAME: ${{ inputs.binary-name }}
+        run: |
+          {
+            echo "### Binary release ${VERSION}"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Targets | \`${PLATFORMS}\` |"
+            echo "| Release | ${URL:-n/a} |"
+            echo "| Checksums signed | \`${SIGNED}\` |"
+            echo ""
+            echo "Verify:"
+            echo '```bash'
+            echo "sha256sum -c ${BINARY_NAME}_${VERSION}_checksums.txt"
+            echo "cosign verify-blob \\"
+            echo "  --certificate ${BINARY_NAME}_${VERSION}_checksums.txt.pem \\"
+            echo "  --signature ${BINARY_NAME}_${VERSION}_checksums.txt.sig \\"
+            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com \\"
+            echo "  --certificate-identity-regexp '.*/echo-pong-workflows/.github/workflows/release.yml@.*' \\"
+            echo "  ${BINARY_NAME}_${VERSION}_checksums.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,296 @@
+# Reusable Terraform validation, callable by echo-pong-infrastructure.
+#
+# SCOPE BOUNDARY: this workflow validates. It never applies.
+# `terraform apply` lives in echo-pong-infrastructure's own thin caller, gated
+# by the `production-infra` GitHub Environment with required reviewers and
+# assuming `echo-pong-gh-tf-apply`. That trigger is deliberately NOT reusable
+# logic: the decision to mutate production infrastructure is repository policy,
+# and burying it behind a `uses:` in a shared repo would mean a change here
+# could silently alter who is allowed to apply, and when. Validation logic is
+# shared; the apply trigger is owned locally where its protection rules are
+# visible next to it.
+#
+# The default path (everything except `plan`) needs NO cloud credentials:
+# fmt, validate with `-backend=false`, TFLint, Checkov, Trivy config and
+# Gitleaks are all static analysis over the checked-out HCL.
+name: Reusable Terraform validation
+
+on:
+  workflow_call:
+    inputs:
+      terraform-version:
+        type: string
+        default: "1.9.8"
+      working-directory:
+        type: string
+        default: "."
+        description: "Root module directory validated by init/validate/plan."
+      fmt-check-recursive:
+        type: boolean
+        default: true
+        description: "Run `terraform fmt -check` across the whole tree, not just the root module."
+      tflint-version:
+        type: string
+        default: "v0.53.0"
+      checkov-soft-fail:
+        type: boolean
+        default: false
+        description: "Leave false to fail closed on policy findings."
+      checkov-skip-checks:
+        type: string
+        default: ""
+        description: "Comma-separated Checkov check IDs to skip; each one needs a written justification in the caller."
+      trivy-config-severity:
+        type: string
+        default: "HIGH,CRITICAL"
+      run-gitleaks:
+        type: boolean
+        default: true
+      run-terraform-docs-check:
+        type: boolean
+        default: true
+        description: "Fail when README module docs are stale relative to variables/outputs."
+      terraform-docs-working-dir:
+        type: string
+        default: "."
+      run-plan:
+        type: boolean
+        default: false
+        description: >-
+          Speculative plan. OFF by default and intentionally so: a plan needs
+          real AWS credentials and real state/backend access, which is a
+          materially different trust level from static analysis. The consuming
+          repository must (a) have `echo-pong-gh-tf-plan` provisioned with an
+          OIDC trust policy that actually names that repo and ref, and (b) opt
+          in per call. A plan is read-mostly, not read-only -- providers refresh
+          state and some data sources have side effects -- so it should be
+          authorised explicitly, not fired on every PR from every fork.
+      plan-role-to-assume:
+        type: string
+        default: ""
+        description: "ARN of `echo-pong-gh-tf-plan`. Required when run-plan is true."
+      aws-region:
+        type: string
+        default: ""
+        description: "Required when run-plan is true."
+      plan-args:
+        type: string
+        default: ""
+        description: "Extra args for `terraform plan`, e.g. -var-file=envs/dev/terraform.tfvars."
+      runs-on:
+        type: string
+        default: "ubuntu-latest"
+    outputs:
+      plan-exitcode:
+        description: >-
+          `terraform plan -detailed-exitcode` result: 0 no changes, 2 changes.
+          Empty when run-plan is false.
+        value: ${{ jobs.plan.outputs.exitcode }}
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: fmt / init / validate
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+          terraform_wrapper: false
+
+      - name: terraform fmt -check
+        env:
+          RECURSIVE: ${{ inputs.fmt-check-recursive }}
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          set -euo pipefail
+          if [ "${RECURSIVE}" = "true" ]; then
+            terraform fmt -check -recursive -diff
+          else
+            terraform fmt -check -diff
+          fi
+
+      # -backend=false: no S3/DynamoDB access, no credentials, no state lock.
+      # Enough to resolve providers and modules for `validate`.
+      - name: terraform init (no backend)
+        working-directory: ${{ inputs.working-directory }}
+        run: terraform init -backend=false -input=false
+
+      - name: terraform validate
+        working-directory: ${{ inputs.working-directory }}
+        run: terraform validate -no-color
+
+  lint:
+    name: TFLint
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: ${{ inputs.tflint-version }}
+
+      - name: tflint --init
+        working-directory: ${{ inputs.working-directory }}
+        run: tflint --init
+        env:
+          # Raises the plugin-download rate limit; the ambient token suffices.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: tflint
+        working-directory: ${{ inputs.working-directory }}
+        run: tflint --recursive --format compact
+
+  security:
+    name: Checkov / Trivy config / Gitleaks
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Gitleaks needs history to scan past commits, not just the tip.
+          fetch-depth: 0
+
+      - name: Checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: ${{ inputs.working-directory }}
+          framework: terraform
+          soft_fail: ${{ inputs.checkov-soft-fail }}
+          skip_check: ${{ inputs.checkov-skip-checks }}
+          output_format: cli
+          quiet: true
+
+      - name: Trivy config scan
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          scan-type: config
+          scan-ref: ${{ inputs.working-directory }}
+          severity: ${{ inputs.trivy-config-severity }}
+          exit-code: "1"
+          hide-progress: true
+
+      - name: Gitleaks
+        if: ${{ inputs.run-gitleaks }}
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  docs:
+    name: terraform-docs freshness
+    if: ${{ inputs.run-terraform-docs-check }}
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # fail-on-diff turns this into a check rather than an auto-commit: docs
+      # regenerate locally and land in the same PR as the variable change.
+      - name: Check module docs are current
+        uses: terraform-docs/gh-actions@v1
+        with:
+          working-dir: ${{ inputs.terraform-docs-working-dir }}
+          output-file: README.md
+          output-method: inject
+          fail-on-diff: true
+          git-push: false
+          recursive: true
+
+  plan:
+    name: Speculative plan (opt-in)
+    if: ${{ inputs.run-plan }}
+    needs: validate
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+      # Only job in this workflow that touches AWS, so the only one granted OIDC.
+      id-token: write
+    outputs:
+      exitcode: ${{ steps.plan.outputs.exitcode }}
+    steps:
+      - name: Assert plan prerequisites
+        env:
+          ROLE: ${{ inputs.plan-role-to-assume }}
+          REGION: ${{ inputs.aws-region }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ROLE}" ] || [ -z "${REGION}" ]; then
+            echo "::error::run-plan=true requires plan-role-to-assume (echo-pong-gh-tf-plan ARN) and aws-region."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.plan-role-to-assume }}
+          aws-region: ${{ inputs.aws-region }}
+          role-session-name: gh-echo-pong-tf-plan-${{ github.run_id }}
+
+      # Real backend this time -- a speculative plan must read live state.
+      - name: terraform init
+        working-directory: ${{ inputs.working-directory }}
+        run: terraform init -input=false
+
+      - name: terraform plan
+        id: plan
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          PLAN_ARGS: ${{ inputs.plan-args }}
+        run: |
+          set -euo pipefail
+          set +e
+          # shellcheck disable=SC2086 # PLAN_ARGS is an intentional flag list.
+          terraform plan -input=false -lock=false -no-color -detailed-exitcode ${PLAN_ARGS} \
+            -out=tfplan | tee plan.txt
+          code="${PIPESTATUS[0]}"
+          set -e
+          echo "exitcode=${code}" >> "$GITHUB_OUTPUT"
+          case "${code}" in
+            0) echo "No changes." ;;
+            2) echo "Changes detected (expected for a speculative plan)." ;;
+            *) echo "::error::terraform plan failed with exit code ${code}." ; exit "${code}" ;;
+          esac
+
+      - name: Publish plan summary
+        if: always()
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          {
+            echo "### terraform plan (speculative)"
+            echo ""
+            echo '```terraform'
+            # Truncated: a full plan can exceed the 1 MiB job-summary limit.
+            tail -c 60000 plan.txt 2>/dev/null || echo "(no plan output captured)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Plan files embed resource attributes, which routinely include values
+      # that are sensitive in aggregate. Short retention, and never a public
+      # artifact on a fork PR.
+      - name: Upload plan
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ github.run_id }}
+          path: |
+            ${{ inputs.working-directory }}/tfplan
+            ${{ inputs.working-directory }}/plan.txt
+          if-no-files-found: warn
+          retention-days: 5

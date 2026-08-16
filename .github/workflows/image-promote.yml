@@ -1,0 +1,270 @@
+# Reusable promotion: quarantine -> production ECR, by COPY, never by rebuild.
+#
+# THE INVARIANT THIS WORKFLOW EXISTS TO ENFORCE:
+# The bytes running in production must be the bytes that were scanned. A build
+# is not reproducible in the bit-for-bit sense -- timestamps, base-image
+# resolution and layer ordering all drift -- so rebuilding from the same commit
+# after a passing scan produces a DIFFERENT digest, and the scan result no
+# longer describes the artefact you shipped. Promotion is therefore a registry
+# copy of an existing digest: `crane copy` transfers the manifest list, every
+# child architecture manifest and every referenced blob verbatim. The content
+# digest is computed over that content, so an unchanged digest after the copy is
+# a cryptographic proof that nothing was rebuilt or mutated. The workflow
+# asserts this explicitly and fails if the destination digest differs.
+#
+# COSIGN IDENTITY -- READ BEFORE WRITING THE KYVERNO POLICY:
+# Signing happens INSIDE this reusable workflow, so Fulcio issues the
+# certificate against the `job_workflow_ref` claim, which names THIS file, not
+# the caller's. The verifiable identity is therefore
+#     https://github.com/<owner>/echo-pong-workflows/.github/workflows/image-promote.yml@<ref>
+# and NOT the app repo's ci.yml. Admission policy in echo-pong-gitops must use
+# the former. The `emit-identity` step below prints the identity cosign actually
+# recorded, so the policy can be copied from a real run rather than guessed.
+name: Reusable image promotion (quarantine -> production)
+
+on:
+  workflow_call:
+    inputs:
+      aws-region:
+        type: string
+        required: true
+      aws-role-to-assume:
+        type: string
+        required: true
+        description: "ARN of `echo-pong-gh-ecr-release` (pull from quarantine, push to production)."
+      image-digest:
+        type: string
+        required: true
+        description: >-
+          The EXACT manifest-list digest emitted by image-scan.yml. Passing any
+          other value, or a tag, defeats the entire quarantine pattern.
+      source-repository:
+        type: string
+        default: "echo-pong-quarantine"
+      target-repository:
+        type: string
+        default: "echo-pong"
+      production-tag:
+        type: string
+        default: ""
+        description: >-
+          Optional immutable tag applied in production alongside the digest,
+          e.g. a SemVer release tag. Both ECR repositories have tag immutability
+          enabled, so a given tag may be written exactly once. Deployments
+          always reference the digest regardless.
+      sign:
+        type: boolean
+        default: true
+        description: "Cosign keyless signature via Sigstore/Fulcio, logged to Rekor."
+      attest-provenance:
+        type: boolean
+        default: true
+        description: "SLSA/in-toto provenance attestation for the promotion event."
+      runs-on:
+        type: string
+        default: "ubuntu-latest"
+    outputs:
+      production-digest:
+        description: "Digest in the production repository. Asserted equal to image-digest."
+        value: ${{ jobs.promote.outputs.production-digest }}
+      production-image-ref:
+        description: "Digest-pinned production ref for GitOps to deploy."
+        value: ${{ jobs.promote.outputs.production-image-ref }}
+      production-repository-uri:
+        description: "Production repository URI with no tag or digest."
+        value: ${{ jobs.promote.outputs.production-repository-uri }}
+      cosign-identity:
+        description: "Certificate identity recorded by Cosign; use verbatim in the Kyverno policy."
+        value: ${{ jobs.promote.outputs.cosign-identity }}
+
+permissions:
+  contents: read
+
+jobs:
+  promote:
+    name: Copy, sign, attest
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+      # AWS OIDC + Sigstore keyless both consume this token.
+      id-token: write
+      # actions/attest-build-provenance writes to the attestations store.
+      attestations: write
+    outputs:
+      production-digest: ${{ steps.copy.outputs.production-digest }}
+      production-image-ref: ${{ steps.copy.outputs.production-image-ref }}
+      production-repository-uri: ${{ steps.copy.outputs.production-repo }}
+      cosign-identity: ${{ steps.identity.outputs.cosign-identity }}
+    steps:
+      - name: Validate inputs
+        env:
+          DIGEST: ${{ inputs.image-digest }}
+        run: |
+          set -euo pipefail
+          # Reject anything that is not a bare content digest before touching
+          # the registry -- a tag here would let a mutable reference be promoted.
+          if ! printf '%s' "${DIGEST}" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+            echo "::error::image-digest must be a full sha256 content digest, got '${DIGEST}'."
+            exit 1
+          fi
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.aws-role-to-assume }}
+          aws-region: ${{ inputs.aws-region }}
+          role-session-name: gh-echo-pong-promote-${{ github.run_id }}
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Install crane
+        uses: imjasonh/setup-crane@v0.4
+
+      - name: Copy manifest list to production
+        id: copy
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+          SOURCE_REPO: ${{ inputs.source-repository }}
+          TARGET_REPO: ${{ inputs.target-repository }}
+          DIGEST: ${{ inputs.image-digest }}
+          PRODUCTION_TAG: ${{ inputs.production-tag }}
+        run: |
+          set -euo pipefail
+          src_repo="${ECR_REGISTRY}/${SOURCE_REPO}"
+          dst_repo="${ECR_REGISTRY}/${TARGET_REPO}"
+          src="${src_repo}@${DIGEST}"
+
+          echo "Source manifest (pre-copy):"
+          crane manifest "${src}" | jq '{mediaType, manifests: [.manifests[]? | {digest, platform}]}'
+
+          # `crane copy` is a registry-to-registry blob/manifest transfer. It
+          # does not unpack, re-tar or re-compress anything, so child manifests
+          # and blobs keep their identity. No `docker build` anywhere in this file.
+          echo "Copying ${src} -> ${dst_repo} (by digest, no rebuild)"
+          crane copy "${src}" "${dst_repo}@${DIGEST}"
+
+          if [ -n "${PRODUCTION_TAG}" ]; then
+            echo "Applying immutable production tag '${PRODUCTION_TAG}'"
+            crane tag "${dst_repo}@${DIGEST}" "${PRODUCTION_TAG}"
+          fi
+
+          production_digest="$(crane digest "${dst_repo}@${DIGEST}")"
+
+          # The assertion the quarantine pattern rests on.
+          if [ "${production_digest}" != "${DIGEST}" ]; then
+            echo "::error::Promotion integrity check FAILED." \
+                 "Scanned digest ${DIGEST} but production resolved to ${production_digest}." \
+                 "The promoted artefact is not the artefact that was scanned; refusing to continue."
+            exit 1
+          fi
+          echo "Integrity check passed: production digest == scanned digest (${production_digest})."
+
+          {
+            echo "production-repo=${dst_repo}"
+            echo "production-digest=${production_digest}"
+            echo "production-image-ref=${dst_repo}@${production_digest}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Verify child manifests copied intact
+        env:
+          SRC: ${{ steps.ecr.outputs.registry }}/${{ inputs.source-repository }}@${{ inputs.image-digest }}
+          DST: ${{ steps.copy.outputs.production-image-ref }}
+        run: |
+          set -euo pipefail
+          # Belt-and-braces: equal index digests already imply equal children,
+          # but comparing the child digest sets makes the guarantee legible in
+          # the log for anyone auditing a release.
+          src_children="$(crane manifest "${SRC}" | jq -S -c '[.manifests[]?.digest] | sort')"
+          dst_children="$(crane manifest "${DST}" | jq -S -c '[.manifests[]?.digest] | sort')"
+          echo "source children:      ${src_children}"
+          echo "destination children: ${dst_children}"
+          if [ "${src_children}" != "${dst_children}" ]; then
+            echo "::error::Child manifest sets differ between quarantine and production."
+            exit 1
+          fi
+          echo "All architecture manifests copied verbatim."
+
+      - name: Install Cosign
+        if: ${{ inputs.sign }}
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign production image (keyless)
+        if: ${{ inputs.sign }}
+        env:
+          IMAGE_REF: ${{ steps.copy.outputs.production-image-ref }}
+        run: |
+          set -euo pipefail
+          # Keyless: ephemeral key, Fulcio-issued cert bound to this workflow's
+          # OIDC identity, entry recorded in the Rekor transparency log.
+          # No private key material exists to be stolen or rotated.
+          cosign sign --yes "${IMAGE_REF}"
+
+      - name: Capture and verify Cosign identity
+        id: identity
+        if: ${{ inputs.sign }}
+        env:
+          IMAGE_REF: ${{ steps.copy.outputs.production-image-ref }}
+        run: |
+          set -euo pipefail
+          # Verify against a permissive identity regexp purely to READ BACK the
+          # identity Fulcio actually issued, then publish it. This removes the
+          # guesswork from writing the admission policy: whatever is printed
+          # here is what Kyverno must be configured to expect.
+          verify_json="$(cosign verify \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            --certificate-identity-regexp '.*' \
+            --output json \
+            "${IMAGE_REF}")"
+
+          identity="$(printf '%s' "${verify_json}" \
+            | jq -r '.[0].optional.Subject // .[0].optional.Issuer // empty')"
+          if [ -z "${identity}" ]; then
+            identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/image-promote.yml@${GITHUB_REF}"
+            echo "::warning::Could not read the certificate subject from cosign output;" \
+                 "reporting the expected identity derived from the run context instead."
+          fi
+          echo "cosign-identity=${identity}" >> "$GITHUB_OUTPUT"
+
+      # GitHub-native SLSA provenance for the promotion event itself, pushed to
+      # the registry alongside the image so it travels with the artefact.
+      - name: Attest promotion provenance
+        if: ${{ inputs.attest-provenance }}
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ steps.copy.outputs.production-repo }}
+          subject-digest: ${{ steps.copy.outputs.production-digest }}
+          push-to-registry: true
+
+      - name: Summarise promotion
+        if: always()
+        env:
+          SRC_REPO: ${{ inputs.source-repository }}
+          DST_REF: ${{ steps.copy.outputs.production-image-ref }}
+          DIGEST: ${{ inputs.image-digest }}
+          IDENTITY: ${{ steps.identity.outputs.cosign-identity }}
+          SIGNED: ${{ inputs.sign }}
+        run: |
+          {
+            echo "### Promotion complete"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Operation | \`crane copy\` -- **copy, not rebuild** |"
+            echo "| Scanned digest | \`${DIGEST}\` |"
+            echo "| Production ref | \`${DST_REF}\` |"
+            echo "| Digest unchanged | yes (asserted; job fails otherwise) |"
+            echo "| Signed | \`${SIGNED}\` |"
+            echo "| Cosign identity | \`${IDENTITY:-n/a}\` |"
+            echo ""
+            echo "The production image is byte-for-byte the artefact that passed"
+            echo "scanning in \`${SRC_REPO}\`: promotion transferred existing manifests"
+            echo "and blobs by digest and the destination digest was verified equal to"
+            echo "the source. No \`docker build\` runs in this workflow. Had the image"
+            echo "been rebuilt after scanning, the digest would have changed and the"
+            echo "scan result would no longer describe what production runs."
+            echo ""
+            echo "Configure admission policy against the **Cosign identity above**,"
+            echo "which names this reusable workflow -- not the calling repository's."
+          } >> "$GITHUB_STEP_SUMMARY"

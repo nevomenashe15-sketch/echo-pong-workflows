@@ -1,0 +1,295 @@
+# Reusable vulnerability scan + SBOM generation for a quarantined manifest list.
+#
+# WHY PER-ARCHITECTURE SCANNING:
+# A manifest list is only an index -- it contains no layers of its own. Pointing
+# a scanner at the list makes the scanner pick ONE child manifest, and which one
+# it picks is a function of the scanner host's architecture (amd64 on
+# GitHub-hosted runners). The arm64 image would then never be scanned at all,
+# even though it ships a different compiled binary and, for images with a distro
+# base, a different set of arch-specific packages. This workflow therefore
+# enumerates the index, fans out over every real platform manifest, and scans
+# each child digest individually. Fail-closed on any architecture blocks
+# promotion of the whole list.
+#
+# SCANNER CHOICE: Trivy. It already scans this organisation's Python image in
+# ci-cd-templates (one scanner, one severity vocabulary, one set of ignore
+# semantics across languages), it reads Go binary build info directly -- which
+# matters because the distroless final stage has no package manager for a
+# scanner to interrogate -- and it needs no daemon. Grype is a credible
+# equivalent and would also handle Go binaries; it was not chosen because
+# running two scanners doubles triage cost without doubling coverage here.
+#
+# SBOM CHOICE: Syft, CycloneDX JSON, one document per architecture. Syft is the
+# generator behind Trivy's own SBOM output and emits both CycloneDX and SPDX;
+# CycloneDX JSON was chosen for its first-class VEX/vulnerability linkage, which
+# is what makes an SBOM useful for later triage rather than just an inventory.
+# Per-architecture documents are emitted rather than one list-level document for
+# exactly the reason given above: the two children have different contents.
+name: Reusable image scan (quarantine)
+
+on:
+  workflow_call:
+    inputs:
+      aws-region:
+        type: string
+        required: true
+      aws-role-to-assume:
+        type: string
+        required: true
+        description: >-
+          ARN of `echo-pong-gh-ecr-release`. Only ECR pull is exercised here,
+          but the release role already carries it; a dedicated read-only role
+          may be substituted by the caller without changing this workflow.
+      image-digest:
+        type: string
+        required: true
+        description: "Manifest-list digest (sha256:...) emitted by image-build-quarantine.yml."
+      ecr-quarantine-repository:
+        type: string
+        default: "echo-pong-quarantine"
+      severity:
+        type: string
+        default: "HIGH,CRITICAL"
+        description: "Comma-separated Trivy severities that FAIL the job."
+      ignore-unfixed:
+        type: boolean
+        default: false
+        description: >-
+          Leave false to fail closed. Setting it true suppresses findings with
+          no upstream fix, which is a risk acceptance decision, not a default.
+      sbom-format:
+        type: string
+        default: "cyclonedx-json"
+        description: "Syft output format. `spdx-json` is the supported alternative."
+      artifact-retention-days:
+        type: number
+        default: 30
+      trivy-timeout:
+        type: string
+        default: "10m"
+      runs-on:
+        type: string
+        default: "ubuntu-latest"
+    outputs:
+      scanned-digest:
+        description: "The manifest-list digest that passed. Feed exactly this value to image-promote.yml."
+        value: ${{ jobs.summarise.outputs.scanned-digest }}
+      platforms-scanned:
+        description: "JSON array of the platform manifests that were individually scanned."
+        value: ${{ jobs.enumerate.outputs.platforms }}
+      sbom-artifact:
+        description: "Name of the uploaded SBOM artifact bundle."
+        value: ${{ jobs.summarise.outputs.sbom-artifact }}
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Expand the manifest list into its real platform children.
+  # ---------------------------------------------------------------------------
+  enumerate:
+    name: Enumerate architecture manifests
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      platforms: ${{ steps.list.outputs.platforms }}
+      repository-uri: ${{ steps.list.outputs.repository-uri }}
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.aws-role-to-assume }}
+          aws-region: ${{ inputs.aws-region }}
+          role-session-name: gh-echo-pong-scan-enum-${{ github.run_id }}
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Install crane
+        uses: imjasonh/setup-crane@v0.4
+
+      - name: Read manifest list
+        id: list
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+          REPO_NAME: ${{ inputs.ecr-quarantine-repository }}
+          DIGEST: ${{ inputs.image-digest }}
+        run: |
+          set -euo pipefail
+          repo="${ECR_REGISTRY}/${REPO_NAME}"
+          manifest="$(crane manifest "${repo}@${DIGEST}")"
+
+          media_type="$(printf '%s' "${manifest}" | jq -r '.mediaType // empty')"
+          echo "Index media type: ${media_type:-<none>}"
+
+          # Filter out attestation manifests. Buildx records SLSA provenance as
+          # extra children with platform unknown/unknown; they carry no runnable
+          # layers and Trivy cannot scan them.
+          platforms="$(printf '%s' "${manifest}" | jq -c '
+            [ (.manifests // [])[]
+              | select(.platform.os != "unknown" and .platform.architecture != "unknown")
+              | { digest: .digest,
+                  platform: (.platform.os + "/" + .platform.architecture),
+                  slug: (.platform.os + "-" + .platform.architecture) } ]')"
+
+          count="$(printf '%s' "${platforms}" | jq 'length')"
+          if [ "${count}" -eq 0 ]; then
+            echo "::error::${repo}@${DIGEST} exposed no scannable platform manifests." \
+                 "A single-architecture image was pushed where a manifest list was expected," \
+                 "or the digest is wrong. Failing closed rather than scanning nothing."
+            exit 1
+          fi
+
+          echo "Will scan ${count} architecture manifest(s): ${platforms}"
+          echo "platforms=${platforms}" >> "$GITHUB_OUTPUT"
+          echo "repository-uri=${repo}" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # One scan + one SBOM per architecture. fail-fast is off so a HIGH on amd64
+  # does not hide a CRITICAL on arm64 -- operators get the full picture in one run.
+  # ---------------------------------------------------------------------------
+  scan:
+    name: Scan ${{ matrix.target.platform }}
+    needs: enumerate
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.enumerate.outputs.platforms) }}
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.aws-role-to-assume }}
+          aws-region: ${{ inputs.aws-region }}
+          role-session-name: gh-echo-pong-scan-${{ github.run_id }}
+
+      # Populates ~/.docker/config.json, which both Trivy and Syft read for
+      # registry authentication.
+      - name: Log in to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Resolve architecture image reference
+        id: ref
+        env:
+          REPO_URI: ${{ needs.enumerate.outputs.repository-uri }}
+          CHILD_DIGEST: ${{ matrix.target.digest }}
+        run: |
+          set -euo pipefail
+          # Addressed by the CHILD digest, so the scanner cannot silently
+          # re-resolve the index to the runner's own architecture.
+          echo "image-ref=${REPO_URI}@${CHILD_DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Trivy vulnerability scan (fail closed)
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          image-ref: ${{ steps.ref.outputs.image-ref }}
+          scan-type: image
+          format: table
+          severity: ${{ inputs.severity }}
+          ignore-unfixed: ${{ inputs.ignore-unfixed }}
+          exit-code: "1"
+          timeout: ${{ inputs.trivy-timeout }}
+
+      # Machine-readable copy of the same scan. `if: always()` so the report is
+      # still archived for the run that failed -- that is the run you most need
+      # it for.
+      - name: Trivy JSON report
+        if: always()
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          image-ref: ${{ steps.ref.outputs.image-ref }}
+          scan-type: image
+          format: json
+          output: trivy-${{ matrix.target.slug }}.json
+          severity: ${{ inputs.severity }}
+          ignore-unfixed: ${{ inputs.ignore-unfixed }}
+          exit-code: "0"
+          timeout: ${{ inputs.trivy-timeout }}
+
+      - name: Install Syft
+        if: always()
+        uses: anchore/sbom-action/download-syft@v0
+
+      - name: Generate SBOM
+        if: always()
+        env:
+          IMAGE_REF: ${{ steps.ref.outputs.image-ref }}
+          SBOM_FORMAT: ${{ inputs.sbom-format }}
+          SLUG: ${{ matrix.target.slug }}
+        run: |
+          set -euo pipefail
+          syft "registry:${IMAGE_REF}" \
+            --output "${SBOM_FORMAT}=sbom-${SLUG}.json"
+
+      - name: Upload scan artefacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-scan-${{ matrix.target.slug }}
+          path: |
+            sbom-${{ matrix.target.slug }}.json
+            trivy-${{ matrix.target.slug }}.json
+          if-no-files-found: warn
+          retention-days: ${{ inputs.artifact-retention-days }}
+
+  # ---------------------------------------------------------------------------
+  # Gate. Only reached when EVERY architecture scan succeeded, so the digest it
+  # emits is the one downstream promotion is allowed to trust.
+  # ---------------------------------------------------------------------------
+  summarise:
+    name: Consolidate scan result
+    needs: [enumerate, scan]
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+    outputs:
+      scanned-digest: ${{ steps.gate.outputs.scanned-digest }}
+      sbom-artifact: ${{ steps.gate.outputs.sbom-artifact }}
+    steps:
+      - name: Collect SBOMs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: image-scan-*
+          path: scan-artifacts
+          merge-multiple: true
+
+      - name: Bundle SBOMs
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-bundle-${{ github.run_id }}
+          path: scan-artifacts
+          if-no-files-found: warn
+          retention-days: ${{ inputs.artifact-retention-days }}
+
+      - name: Record verdict
+        id: gate
+        env:
+          DIGEST: ${{ inputs.image-digest }}
+          PLATFORMS: ${{ needs.enumerate.outputs.platforms }}
+          SEVERITY: ${{ inputs.severity }}
+        run: |
+          set -euo pipefail
+          echo "scanned-digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "sbom-artifact=sbom-bundle-${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Scan passed"
+            echo ""
+            echo "Manifest list \`${DIGEST}\` cleared \`${SEVERITY}\` on every architecture."
+            echo ""
+            echo "| Platform | Child manifest digest |"
+            echo "| --- | --- |"
+            printf '%s' "${PLATFORMS}" \
+              | jq -r '.[] | "| `" + .platform + "` | `" + .digest + "` |"'
+            echo ""
+            echo "Promotion must use **this exact manifest-list digest**."
+            echo "Rebuilding from source instead would produce a different digest"
+            echo "and silently discard the result above."
+          } >> "$GITHUB_STEP_SUMMARY"

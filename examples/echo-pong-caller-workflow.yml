@@ -1,0 +1,204 @@
+# =============================================================================
+# ILLUSTRATIVE EXAMPLE -- NOT A LIVE WORKFLOW.
+#
+# This file lives under examples/ and is therefore never executed: GitHub only
+# runs workflows in .github/workflows/. It shows how the echo-pong APPLICATION
+# repository would wire up the reusable workflows in this repo as its own
+# .github/workflows/ci.yml.
+#
+# Adopting it is the app repository's decision and is out of scope here. Copy,
+# adjust the `uses:` owner, set the vars/secrets listed at the bottom, and
+# create the `production-promotion` GitHub Environment first.
+#
+# PINNING: every `uses:` below points at `@v1` -- the floating major tag of this
+# repo. Do NOT pin consumers at `@main`. A reusable workflow referenced by a
+# branch is re-resolved on every run, so any commit to that branch changes the
+# behaviour of every consumer's pipeline at once, with no review from the
+# consumers and no way to roll back other than reverting the shared repo. `@v1`
+# gives consumers additive, backward-compatible updates only. For an audited
+# supply chain, pin to an immutable `@v1.2.3` (or a commit SHA) and bump
+# deliberately.
+# =============================================================================
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Validation. Runs on every push and PR. No cloud credentials whatsoever.
+  # ---------------------------------------------------------------------------
+  ci:
+    name: Go CI
+    uses: nevomenashe15-sketch/echo-pong-workflows/.github/workflows/go-ci.yml@v1
+    permissions:
+      contents: read
+    with:
+      go-version: "1.24"
+
+  # ---------------------------------------------------------------------------
+  # 2. Build the multi-arch image into QUARANTINE. Tags only -- PRs validate but
+  #    never publish, so a fork PR can never push to any registry.
+  #
+  #    The caller's `permissions:` block is the CEILING for the reusable
+  #    workflow's jobs. id-token/packages must be granted HERE or the reusable
+  #    workflow's OIDC and GHCR steps fail outright rather than skipping.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build (quarantine)
+    needs: ci
+    if: startsWith(github.ref, 'refs/tags/v')
+    uses: nevomenashe15-sketch/echo-pong-workflows/.github/workflows/image-build-quarantine.yml@v1
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+    with:
+      aws-region: ${{ vars.AWS_REGION }}
+      # ARN of echo-pong-gh-ecr-release, created by echo-pong-infrastructure.
+      # Held as a repository variable, not baked into any workflow file.
+      aws-role-to-assume: ${{ vars.AWS_ECR_RELEASE_ROLE_ARN }}
+      ecr-quarantine-repository: echo-pong-quarantine
+      platforms: linux/amd64,linux/arm64
+      push-ghcr: true
+
+  # ---------------------------------------------------------------------------
+  # 3. Scan EVERY architecture manifest. Fails closed on HIGH/CRITICAL, which
+  #    blocks promotion because `promote` needs this job.
+  # ---------------------------------------------------------------------------
+  scan:
+    name: Scan (quarantine)
+    needs: build
+    uses: nevomenashe15-sketch/echo-pong-workflows/.github/workflows/image-scan.yml@v1
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      aws-region: ${{ vars.AWS_REGION }}
+      aws-role-to-assume: ${{ vars.AWS_ECR_RELEASE_ROLE_ARN }}
+      image-digest: ${{ needs.build.outputs.image-digest }}
+      severity: HIGH,CRITICAL
+
+  # ---------------------------------------------------------------------------
+  # 4. HUMAN APPROVAL GATE.
+  #
+  #    The gate is the `environment:` key, not this job's body. Configure the
+  #    `production-promotion` GitHub Environment with required reviewers; the
+  #    run then pauses here until a reviewer approves. The job does nothing but
+  #    exist -- putting the gate on a no-op job keeps the approval decoupled
+  #    from the promotion logic, so an approver is approving "promote this
+  #    digest", not re-running arbitrary steps.
+  #
+  #    An environment gate cannot be declared on a `uses:` job together with
+  #    `with:`/`secrets:` in all cases, so the gate is its own job and
+  #    `promote` simply `needs:` it.
+  # ---------------------------------------------------------------------------
+  approve-promotion:
+    name: Approve promotion to production
+    needs: scan
+    runs-on: ubuntu-latest
+    environment: production-promotion
+    permissions: {}
+    steps:
+      - name: Record approval
+        env:
+          DIGEST: ${{ needs.scan.outputs.scanned-digest }}
+          PLATFORMS: ${{ needs.scan.outputs.platforms-scanned }}
+        run: |
+          {
+            echo "### Approved for promotion"
+            echo ""
+            echo "Digest: \`${DIGEST}\`"
+            echo ""
+            echo "Scanned platforms: \`${PLATFORMS}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # 5. Promote by COPY to the production ECR repo, then sign + attest.
+  #    Note the digest comes from `scan`, not from `build`: same value, but
+  #    sourcing it from the gate that validated it makes the dependency on a
+  #    passing scan explicit rather than incidental.
+  # ---------------------------------------------------------------------------
+  promote:
+    name: Promote to production
+    needs: [scan, approve-promotion]
+    uses: nevomenashe15-sketch/echo-pong-workflows/.github/workflows/image-promote.yml@v1
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    with:
+      aws-region: ${{ vars.AWS_REGION }}
+      aws-role-to-assume: ${{ vars.AWS_ECR_RELEASE_ROLE_ARN }}
+      image-digest: ${{ needs.scan.outputs.scanned-digest }}
+      source-repository: echo-pong-quarantine
+      target-repository: echo-pong
+      production-tag: ${{ github.ref_name }}
+
+  # ---------------------------------------------------------------------------
+  # 6. Propose the GitOps change. Opens a PR; does not deploy. Production still
+  #    requires a human to review and merge that PR before Argo CD syncs.
+  # ---------------------------------------------------------------------------
+  gitops:
+    name: Propose GitOps update
+    needs: promote
+    uses: nevomenashe15-sketch/echo-pong-workflows/.github/workflows/gitops-propose-update.yml@v1
+    permissions:
+      contents: read
+    with:
+      gitops-repository: nevomenashe15-sketch/echo-pong-gitops
+      environment: production
+      image-repository: ${{ needs.promote.outputs.production-repository-uri }}
+      image-digest: ${{ needs.promote.outputs.production-digest }}
+      chart-path: charts/echo-pong
+      use-github-app: true
+    secrets:
+      gitops-app-id: ${{ secrets.GITOPS_APP_ID }}
+      gitops-app-private-key: ${{ secrets.GITOPS_APP_PRIVATE_KEY }}
+
+  # ---------------------------------------------------------------------------
+  # 7. Binary release, in parallel with the image path -- neither blocks the
+  #    other, and a binary publish failure must not strand a promoted image.
+  # ---------------------------------------------------------------------------
+  binaries:
+    name: Binary release
+    needs: ci
+    if: startsWith(github.ref, 'refs/tags/v')
+    uses: nevomenashe15-sketch/echo-pong-workflows/.github/workflows/release.yml@v1
+    permissions:
+      contents: write
+      id-token: write
+    with:
+      binary-name: ping-pong-game
+      platforms: '["linux/amd64","linux/arm64","darwin/arm64"]'
+
+# =============================================================================
+# PREREQUISITES in the calling repository
+#
+# Repository variables (vars.*) -- non-secret, but not hardcoded in YAML:
+#   AWS_REGION                  e.g. eu-west-1
+#   AWS_ECR_RELEASE_ROLE_ARN    ARN of echo-pong-gh-ecr-release
+#
+# Repository secrets:
+#   GITOPS_APP_ID               GitHub App installed on echo-pong-gitops ONLY
+#   GITOPS_APP_PRIVATE_KEY      that App's private key (PEM)
+#
+# Environments:
+#   production-promotion        required reviewers; gates step 4
+#
+# AWS side (owned by echo-pong-infrastructure):
+#   echo-pong-gh-ecr-release must trust this repository's OIDC subject for the
+#   tag refs used above (e.g. repo:<owner>/echo-pong:ref:refs/tags/v*), with no
+#   wildcard repository trust.
+# =============================================================================

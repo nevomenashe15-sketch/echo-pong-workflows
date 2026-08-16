@@ -1,0 +1,289 @@
+# Reusable GitOps update proposal: open a PR against echo-pong-gitops.
+#
+# HARD BOUNDARY -- THIS WORKFLOW NEVER TOUCHES A CLUSTER.
+# It has no kubeconfig, no cluster credentials, and must never gain `kubectl`,
+# `helm upgrade`, `helm install`, `argocd app sync` or any other imperative
+# cluster call. Its entire output is a Git pull request that changes one field
+# in one values file. Argo CD is the only actor permitted to apply state to the
+# cluster, and for production it does so only after a human has reviewed and
+# merged that PR. This preserves the properties GitOps is adopted for: Git is
+# the single source of truth, every change is reviewable and revertible, and a
+# compromised CI runner cannot reach the cluster because CI holds no credential
+# that can. Adding a cluster-mutating step here would collapse that boundary
+# while leaving the surrounding architecture looking unchanged.
+#
+# CROSS-REPOSITORY WRITE ACCESS:
+# The ambient GITHUB_TOKEN is scoped to the repository whose workflow is
+# running; it cannot open a PR against a different repository no matter what
+# `permissions:` block is declared. A caller-supplied credential is therefore
+# mandatory. Two options, both supported below via `use-github-app`:
+#
+#   1. GitHub App installation token (RECOMMENDED). Install a dedicated App on
+#      echo-pong-gitops ONLY, with Contents: write + Pull requests: write.
+#      Tokens are minted per run and expire in one hour, the App is not tied to
+#      any employee's account, and its installation cannot be widened without an
+#      audited change. Supply `gitops-app-id` + `gitops-app-private-key`.
+#   2. Fine-grained PAT. Resource owner scoped to echo-pong-gitops alone, same
+#      two permissions, with an expiry. Simpler to set up, but it belongs to a
+#      human, needs manual rotation, and dies with that account. Supply
+#      `gitops-token`. Acceptable as an interim; the App is the durable answer.
+#
+# A classic PAT with the blanket `repo` scope is not acceptable for either: it
+# grants write access to every repository the holder can see.
+name: Reusable GitOps update proposal
+
+on:
+  workflow_call:
+    inputs:
+      gitops-repository:
+        type: string
+        required: true
+        description: "Target repo in <owner>/<name> form, e.g. <owner>/echo-pong-gitops."
+      environment:
+        type: string
+        required: true
+        description: "Environment overlay to update: dev | staging | production."
+      image-repository:
+        type: string
+        required: true
+        description: "Production ECR repository URI (no tag, no digest), for image.repository."
+      image-digest:
+        type: string
+        required: true
+        description: "APPROVED production digest from image-promote.yml. Must be sha256:...."
+      chart-path:
+        type: string
+        default: "charts/echo-pong"
+        description: "Path to the chart inside the GitOps repo."
+      values-file:
+        type: string
+        default: ""
+        description: "Values file to edit. Defaults to <chart-path>/values-<environment>.yaml."
+      base-branch:
+        type: string
+        default: "main"
+      use-github-app:
+        type: boolean
+        default: true
+        description: >-
+          true  -> mint an installation token from gitops-app-id/gitops-app-private-key.
+          false -> use the gitops-token PAT.
+          Selected by an explicit input rather than by testing whether a secret
+          is set, because the `secrets` context is not available in `if:`
+          conditions; branching on an input keeps the choice auditable.
+      pr-labels:
+        type: string
+        default: "automated,image-promotion"
+      draft:
+        type: boolean
+        default: false
+      runs-on:
+        type: string
+        default: "ubuntu-latest"
+    secrets:
+      gitops-app-id:
+        required: false
+        description: "GitHub App ID. Required when use-github-app is true."
+      gitops-app-private-key:
+        required: false
+        description: "GitHub App private key (PEM). Required when use-github-app is true."
+      gitops-token:
+        required: false
+        description: "Fine-grained PAT scoped to the GitOps repo. Required when use-github-app is false."
+    outputs:
+      pull-request-url:
+        description: "URL of the opened/updated PR."
+        value: ${{ jobs.propose.outputs.pull-request-url }}
+      pull-request-number:
+        description: "Number of the opened/updated PR."
+        value: ${{ jobs.propose.outputs.pull-request-number }}
+
+permissions:
+  contents: read
+
+jobs:
+  propose:
+    name: Open GitOps pull request
+    runs-on: ${{ inputs.runs-on }}
+    # No id-token, no packages, no cluster access. `contents: read` refers to
+    # THIS repository only; write access to the GitOps repo comes exclusively
+    # from the caller-supplied App/PAT credential.
+    permissions:
+      contents: read
+    outputs:
+      pull-request-url: ${{ steps.pr.outputs.pull-request-url }}
+      pull-request-number: ${{ steps.pr.outputs.pull-request-number }}
+    steps:
+      - name: Validate inputs and derive names
+        id: prep
+        env:
+          DIGEST: ${{ inputs.image-digest }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          GITOPS_REPOSITORY: ${{ inputs.gitops-repository }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "${DIGEST}" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+            echo "::error::image-digest must be a full sha256 content digest, got '${DIGEST}'."
+            exit 1
+          fi
+          case "${ENVIRONMENT}" in
+            dev|staging|production) ;;
+            *) echo "::error::environment must be dev, staging or production, got '${ENVIRONMENT}'." ; exit 1 ;;
+          esac
+          if ! printf '%s' "${GITOPS_REPOSITORY}" | grep -Eq '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$'; then
+            echo "::error::gitops-repository must be <owner>/<name>, got '${GITOPS_REPOSITORY}'."
+            exit 1
+          fi
+
+          # create-github-app-token wants BARE repository names, not owner/name.
+          repo_name="${GITOPS_REPOSITORY#*/}"
+          repo_owner="${GITOPS_REPOSITORY%%/*}"
+
+          # Git refuses ':' in branch names, so the raw digest cannot be used.
+          # A 12-hex prefix is unambiguous in practice and keeps the branch
+          # deterministic, so re-running the same promotion updates the existing
+          # PR instead of opening a duplicate.
+          short_digest="$(printf '%s' "${DIGEST#sha256:}" | cut -c1-12)"
+
+          {
+            echo "repo-name=${repo_name}"
+            echo "repo-owner=${repo_owner}"
+            echo "branch=promote/${ENVIRONMENT}-${short_digest}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Mint GitHub App installation token
+        id: app-token
+        if: ${{ inputs.use-github-app }}
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.gitops-app-id }}
+          private-key: ${{ secrets.gitops-app-private-key }}
+          owner: ${{ steps.prep.outputs.repo-owner }}
+          repositories: ${{ steps.prep.outputs.repo-name }}
+
+      - name: Select credential
+        id: creds
+        env:
+          USE_APP: ${{ inputs.use-github-app }}
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+          PAT: ${{ secrets.gitops-token }}
+        run: |
+          set -euo pipefail
+          if [ "${USE_APP}" = "true" ]; then
+            token="${APP_TOKEN}"
+            source="github-app-installation-token"
+          else
+            token="${PAT}"
+            source="fine-grained-pat"
+          fi
+          if [ -z "${token}" ]; then
+            echo "::error::No GitOps credential available (use-github-app=${USE_APP})." \
+                 "Supply gitops-app-id + gitops-app-private-key, or gitops-token."
+            exit 1
+          fi
+          # Masked so it cannot surface in any later log line.
+          echo "::add-mask::${token}"
+          echo "token=${token}" >> "$GITHUB_OUTPUT"
+          echo "Using credential source: ${source}"
+
+      - name: Check out GitOps repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.gitops-repository }}
+          ref: ${{ inputs.base-branch }}
+          token: ${{ steps.creds.outputs.token }}
+          path: gitops
+          persist-credentials: false
+
+      - name: Update image digest in values overlay
+        id: edit
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          CHART_PATH: ${{ inputs.chart-path }}
+          VALUES_FILE: ${{ inputs.values-file }}
+          IMAGE_REPO: ${{ inputs.image-repository }}
+          DIGEST: ${{ inputs.image-digest }}
+        run: |
+          set -euo pipefail
+          cd gitops
+          values_file="${VALUES_FILE:-${CHART_PATH}/values-${ENVIRONMENT}.yaml}"
+          if [ ! -f "${values_file}" ]; then
+            echo "::error::${values_file} not found in ${GITHUB_WORKSPACE}/gitops."
+            exit 1
+          fi
+
+          previous="$(yq -r '.image.digest // ""' "${values_file}")"
+
+          # yq is preinstalled on ubuntu-latest. Structured editing rather than
+          # sed: it cannot corrupt neighbouring keys or comments.
+          IMAGE_REPO="${IMAGE_REPO}" DIGEST="${DIGEST}" yq -i '
+            .image.repository = strenv(IMAGE_REPO) |
+            .image.digest = strenv(DIGEST)
+          ' "${values_file}"
+
+          # `tag` must not survive alongside a digest -- a chart that renders
+          # both leaves it ambiguous which one the cluster actually pulls.
+          if yq -e '.image | has("tag")' "${values_file}" >/dev/null 2>&1; then
+            yq -i 'del(.image.tag)' "${values_file}"
+            echo "Removed image.tag; deployments are digest-pinned."
+          fi
+
+          echo "values-file=${values_file}" >> "$GITHUB_OUTPUT"
+          echo "previous-digest=${previous:-none}" >> "$GITHUB_OUTPUT"
+          echo "--- resulting image block ---"
+          yq '.image' "${values_file}"
+
+      - name: Open pull request
+        id: pr
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ steps.creds.outputs.token }}
+          path: gitops
+          base: ${{ inputs.base-branch }}
+          branch: ${{ steps.prep.outputs.branch }}
+          delete-branch: true
+          draft: ${{ inputs.draft }}
+          labels: ${{ inputs.pr-labels }}
+          commit-message: |
+            chore(${{ inputs.environment }}): pin image to ${{ inputs.image-digest }}
+          title: "Promote ${{ inputs.environment }} to ${{ inputs.image-digest }}"
+          body: |
+            Automated image promotion proposal.
+
+            | Field | Value |
+            | --- | --- |
+            | Environment | `${{ inputs.environment }}` |
+            | Values file | `${{ steps.edit.outputs.values-file }}` |
+            | Repository | `${{ inputs.image-repository }}` |
+            | Previous digest | `${{ steps.edit.outputs.previous-digest }}` |
+            | New digest | `${{ inputs.image-digest }}` |
+            | Source run | ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} |
+
+            This digest was built as a multi-architecture manifest list, scanned
+            per architecture, promoted by registry copy (no rebuild) and signed
+            with Cosign keyless.
+
+            Merging this PR is what triggers the deployment: Argo CD reconciles
+            the change. This workflow did not, and cannot, touch the cluster.
+
+            Rollback is a revert of this commit.
+
+      - name: Summarise
+        env:
+          PR_URL: ${{ steps.pr.outputs.pull-request-url }}
+          PR_OP: ${{ steps.pr.outputs.pull-request-operation }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          DIGEST: ${{ inputs.image-digest }}
+        run: |
+          {
+            echo "### GitOps PR proposed"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Environment | \`${ENVIRONMENT}\` |"
+            echo "| Digest | \`${DIGEST}\` |"
+            echo "| Pull request | ${PR_URL:-none} |"
+            echo "| Operation | \`${PR_OP:-none}\` |"
+            echo ""
+            echo "No cluster was contacted. Argo CD syncs after this PR is merged."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,148 @@
+# Reusable Go application CI (lint / vet / build / test).
+#
+# ROLE: the "CI validation" stage. This workflow deliberately requests NO cloud
+# credentials at all: golangci-lint, go vet, go build and go test are pure local
+# Go tooling and need zero AWS access. It therefore never declares
+# `id-token: write` and never calls aws-actions/configure-aws-credentials.
+# The `echo-pong-gh-ci-validation` IAM role exists in the infrastructure repo for
+# validation steps that DO need read-only AWS describe calls; nothing here does.
+# If that ever changes, add the role as an input to a new, separate job rather
+# than widening this one's permissions.
+name: Reusable Go CI
+
+on:
+  workflow_call:
+    inputs:
+      go-version:
+        type: string
+        default: "1.24"
+        description: "Go toolchain version passed to actions/setup-go."
+      working-directory:
+        type: string
+        default: "."
+        description: "Directory containing go.mod."
+      golangci-lint-version:
+        type: string
+        default: "v2.1.6"
+        description: >-
+          golangci-lint release to run. Must be a v2.x line: the app repo's
+          .golangci.yml declares `version: 2` and golangci-lint v1 cannot
+          parse that schema.
+      golangci-lint-timeout:
+        type: string
+        default: "5m"
+        description: "Overrides the timeout in the consumer's .golangci.yml."
+      go-cache:
+        type: boolean
+        default: false
+        description: >-
+          Enable actions/setup-go module caching. Defaults to false because
+          echo-pong currently has zero external dependencies and therefore no
+          go.sum; setup-go's cache resolution fails when its dependency glob
+          matches nothing. Flip to true once a go.sum exists.
+      test-flags:
+        type: string
+        default: "-race -cover -covermode=atomic"
+        description: "Flags appended to `go test ./...`."
+      runs-on:
+        type: string
+        default: "ubuntu-latest"
+        description: "Runner label for every job in this workflow."
+    outputs:
+      coverage-percent:
+        description: "Total statement coverage reported by `go test`, e.g. `87.5`."
+        value: ${{ jobs.test.outputs.coverage-percent }}
+
+# Workflow-level ceiling: read the source, nothing else.
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: golangci-lint
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.go-version }}
+          cache: ${{ inputs.go-cache }}
+
+      # Uses the CONSUMER repo's own .golangci.yml (checked out above); this
+      # workflow intentionally ships no lint config of its own so the app repo
+      # stays the single source of truth for its lint rules.
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: ${{ inputs.golangci-lint-version }}
+          working-directory: ${{ inputs.working-directory }}
+          args: --timeout=${{ inputs.golangci-lint-timeout }}
+
+  test:
+    name: vet / build / test
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+    outputs:
+      coverage-percent: ${{ steps.cover.outputs.percent }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.go-version }}
+          cache: ${{ inputs.go-cache }}
+
+      - name: Verify go.mod is tidy
+        run: |
+          cp go.mod go.mod.orig
+          if [ -f go.sum ]; then cp go.sum go.sum.orig; fi
+          go mod tidy
+          diff -u go.mod.orig go.mod
+          if [ -f go.sum.orig ]; then diff -u go.sum.orig go.sum; fi
+          rm -f go.mod.orig go.sum.orig
+
+      - name: go vet
+        run: go vet ./...
+
+      # Host-architecture smoke build only. Real multi-arch artifacts are
+      # produced by image-build-quarantine.yml (containers) and release.yml
+      # (binaries); this step exists to fail fast on compile errors.
+      - name: go build (host arch smoke build)
+        run: go build -o /dev/null ./...
+
+      - name: go test
+        env:
+          TEST_FLAGS: ${{ inputs.test-flags }}
+        run: |
+          # shellcheck disable=SC2086 # TEST_FLAGS is an intentional flag list.
+          go test ./... ${TEST_FLAGS} -coverprofile=coverage.out
+
+      - name: Extract coverage percentage
+        id: cover
+        run: |
+          if [ ! -f coverage.out ]; then
+            echo "percent=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          percent="$(go tool cover -func=coverage.out | awk '/^total:/ {gsub(/%/, "", $3); print $3}')"
+          echo "percent=${percent}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Go test coverage"
+            echo ""
+            echo "Total statement coverage: **${percent}%**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload coverage profile
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-coverage
+          path: ${{ inputs.working-directory }}/coverage.out
+          if-no-files-found: warn
+          retention-days: 7

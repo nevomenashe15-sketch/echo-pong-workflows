@@ -1,0 +1,212 @@
+# Reusable Helm chart validation, callable by echo-pong-gitops.
+#
+# Static analysis only: no cluster connection, no kubeconfig, no cloud
+# credentials, no `helm install`. `helm template` renders locally and
+# kubeconform validates the rendered YAML against offline JSON schemas, so this
+# workflow can validate a production overlay without any access to production.
+#
+# Every environment overlay is linted and rendered SEPARATELY. Rendering only
+# the default values.yaml is the common mistake: production overlays are
+# precisely where replica counts, PDBs, HPAs and ingress annotations diverge,
+# so a template bug reachable only with values-production.yaml would otherwise
+# be discovered by Argo CD at sync time in production.
+name: Reusable Helm validation
+
+on:
+  workflow_call:
+    inputs:
+      chart-path:
+        type: string
+        required: true
+        description: "Path to the chart directory, e.g. charts/echo-pong."
+      environments:
+        type: string
+        default: '["dev","staging","production"]'
+        description: "JSON array of overlay names; each maps to <chart-path>/values-<env>.yaml."
+      values-file-prefix:
+        type: string
+        default: "values-"
+      values-file-suffix:
+        type: string
+        default: ".yaml"
+      helm-version:
+        type: string
+        default: "v3.16.3"
+      kubeconform-version:
+        type: string
+        default: "0.6.7"
+      kubernetes-version:
+        type: string
+        default: "1.31.0"
+        description: "Schema version kubeconform validates against; match the EKS control-plane version."
+      yamllint-config:
+        type: string
+        default: ""
+        description: "Path to a yamllint config in the calling repo. Falls back to yamllint's default preset."
+      yamllint-paths:
+        type: string
+        default: "."
+        description: "Space-separated paths to lint."
+      release-name:
+        type: string
+        default: "echo-pong"
+      namespace:
+        type: string
+        default: "echo-pong"
+      strict-lint:
+        type: boolean
+        default: true
+        description: "Treat `helm lint` warnings as failures."
+      runs-on:
+        type: string
+        default: "ubuntu-latest"
+
+permissions:
+  contents: read
+
+jobs:
+  yamllint:
+    name: yamllint
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install yamllint
+        run: pipx install yamllint
+
+      - name: Run yamllint
+        env:
+          CONFIG: ${{ inputs.yamllint-config }}
+          PATHS: ${{ inputs.yamllint-paths }}
+        run: |
+          set -euo pipefail
+          # Helm templates are Go templates, not YAML: `{{- if }}` at the top of
+          # a document is a parse error for any YAML linter. Chart templates are
+          # covered by `helm lint`/`helm template` instead.
+          args=(--strict --format github)
+          if [ -n "${CONFIG}" ]; then
+            args+=(--config-file "${CONFIG}")
+          fi
+          # shellcheck disable=SC2086 # PATHS is an intentional path list.
+          yamllint "${args[@]}" ${PATHS}
+
+  lint-and-render:
+    name: helm lint/template + kubeconform (${{ matrix.environment }})
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: ${{ fromJSON(inputs.environments) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: ${{ inputs.helm-version }}
+
+      - name: Install kubeconform
+        env:
+          KUBECONFORM_VERSION: ${{ inputs.kubeconform-version }}
+        run: |
+          set -euo pipefail
+          curl -fsSL -o kubeconform.tar.gz \
+            "https://github.com/yannh/kubeconform/releases/download/v${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
+          tar -xzf kubeconform.tar.gz kubeconform
+          sudo install -m 0755 kubeconform /usr/local/bin/kubeconform
+          kubeconform -v
+
+      - name: Resolve values file
+        id: values
+        env:
+          CHART_PATH: ${{ inputs.chart-path }}
+          PREFIX: ${{ inputs.values-file-prefix }}
+          SUFFIX: ${{ inputs.values-file-suffix }}
+          ENVIRONMENT: ${{ matrix.environment }}
+        run: |
+          set -euo pipefail
+          values_file="${CHART_PATH}/${PREFIX}${ENVIRONMENT}${SUFFIX}"
+          if [ ! -f "${values_file}" ]; then
+            echo "::error::${values_file} not found."
+            exit 1
+          fi
+          echo "file=${values_file}" >> "$GITHUB_OUTPUT"
+
+      - name: helm dependency build
+        env:
+          CHART_PATH: ${{ inputs.chart-path }}
+        run: |
+          set -euo pipefail
+          if [ -f "${CHART_PATH}/Chart.lock" ] || \
+             grep -qE '^\s*dependencies:' "${CHART_PATH}/Chart.yaml" 2>/dev/null; then
+            helm dependency build "${CHART_PATH}"
+          else
+            echo "No chart dependencies declared; skipping."
+          fi
+
+      - name: helm lint
+        env:
+          CHART_PATH: ${{ inputs.chart-path }}
+          VALUES_FILE: ${{ steps.values.outputs.file }}
+          STRICT: ${{ inputs.strict-lint }}
+        run: |
+          set -euo pipefail
+          args=("${CHART_PATH}" --values "${CHART_PATH}/values.yaml" --values "${VALUES_FILE}")
+          if [ "${STRICT}" = "true" ]; then
+            args+=(--strict)
+          fi
+          helm lint "${args[@]}"
+
+      - name: helm template
+        env:
+          CHART_PATH: ${{ inputs.chart-path }}
+          VALUES_FILE: ${{ steps.values.outputs.file }}
+          RELEASE_NAME: ${{ inputs.release-name }}
+          NAMESPACE: ${{ inputs.namespace }}
+          ENVIRONMENT: ${{ matrix.environment }}
+          KUBE_VERSION: ${{ inputs.kubernetes-version }}
+        run: |
+          set -euo pipefail
+          mkdir -p rendered
+          # Base values first, then the overlay, mirroring how Argo CD renders it.
+          helm template "${RELEASE_NAME}" "${CHART_PATH}" \
+            --namespace "${NAMESPACE}" \
+            --kube-version "${KUBE_VERSION}" \
+            --values "${CHART_PATH}/values.yaml" \
+            --values "${VALUES_FILE}" \
+            > "rendered/${ENVIRONMENT}.yaml"
+          echo "Rendered $(grep -c '^kind:' "rendered/${ENVIRONMENT}.yaml") objects."
+
+      - name: kubeconform (strict)
+        env:
+          ENVIRONMENT: ${{ matrix.environment }}
+          KUBE_VERSION: ${{ inputs.kubernetes-version }}
+        run: |
+          set -euo pipefail
+          # -strict rejects unknown/duplicate fields, which is what catches a
+          # typo'd key that Kubernetes would otherwise silently ignore.
+          # -ignore-missing-schemas skips CRD-backed kinds (Argo CD Application,
+          # ExternalSecret, TargetGroupBinding...) whose schemas are not in the
+          # upstream catalogue; standard kinds are still validated strictly.
+          # -summary makes the skip count visible so a chart that validates
+          # nothing cannot pass unnoticed.
+          kubeconform \
+            -strict \
+            -summary \
+            -verbose \
+            -ignore-missing-schemas \
+            -kubernetes-version "${KUBE_VERSION}" \
+            -schema-location default \
+            "rendered/${ENVIRONMENT}.yaml"
+
+      - name: Upload rendered manifests
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rendered-${{ matrix.environment }}
+          path: rendered/${{ matrix.environment }}.yaml
+          if-no-files-found: warn
+          retention-days: 7
