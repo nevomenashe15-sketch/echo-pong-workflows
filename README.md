@@ -6,8 +6,13 @@ sibling infrastructure/GitOps repositories. Every workflow here is
 own their triggers, their protection rules and their credentials; this
 repository owns the CI/CD *logic*.
 
-> **Status: local staging copy for review.** Not initialised as a Git
-> repository, not pushed, never executed against real GitHub Actions or AWS.
+> **Status:** pushed to [`nevomenashe15-sketch/echo-pong-workflows`](https://github.com/nevomenashe15-sketch/echo-pong-workflows).
+> actionlint- and yamllint-clean, but not yet called by any caller workflow —
+> `echo-pong`'s own `ci.yml`/`release.yml` are still self-contained rather
+> than calling out to this repo's `workflow_call` jobs. Wiring that up is
+> the natural next step if `echo-pong` moves from a standalone assignment
+> submission to living inside this multi-repo estate day-to-day. Never
+> executed against real GitHub Actions or AWS.
 
 ## Repository layout
 
