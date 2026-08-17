@@ -47,6 +47,138 @@ jobs:
     with:
       go-version: "1.24"
 
+  # =============================================================================
+  # CONTINUOUS DEV DEPLOYMENT -- every push to main, no approval gate.
+  #
+  # This chain exists because the tag-only release chain below (build/scan/
+  # approve-promotion/promote/gitops) never runs on an ordinary push to main,
+  # which meant dev's Argo CD Application -- auto-sync, no manual gate, by
+  # design (see echo-pong-gitops's own sync-policy table) -- had nothing to
+  # actually sync. Nothing deployed to dev, ever, until this existed.
+  #
+  # It reuses the SAME image-build-quarantine.yml / image-scan.yml /
+  # image-promote.yml / gitops-propose-update.yml reusable workflows as the
+  # release chain, not a lighter path: echo-pong-gitops's own docs state
+  # quarantine grants no pull access to cluster node roles at all, so a node
+  # physically cannot run a quarantine-only image -- promotion to the single
+  # production `echo-pong` ECR repository is mandatory before ANY cluster,
+  # dev included, can run it. The image itself is identical regardless of
+  # which environment ends up running it; only the human-facing production-tag
+  # is skipped here (dev deploys reference the digest, never a version tag --
+  # tags are reserved for real releases, the chain below).
+  #
+  # What "no approval gate" actually means: no `environment:`-gated job like
+  # `approve-promotion` blocks this chain from running -- but
+  # gitops-propose-update.yml only ever opens a PR (see its own header: never
+  # kubectl). For dev to be genuinely continuous rather than "proposed and
+  # then waiting on a human to click merge," the final step below explicitly
+  # enables GitHub's native auto-merge on that PR using the same GitHub App
+  # credentials already granted to this repo for echo-pong-gitops -- it does
+  # not bypass echo-pong-gitops's own branch protection/required-checks,
+  # it just removes the need for a human to manually press the button once
+  # those pass.
+  # =============================================================================
+  build-dev:
+    name: Build (quarantine) — dev
+    needs: ci
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    uses: nevomenashe15-sketch/echo-pong-workflows/.github/workflows/image-build-quarantine.yml@v1
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+    with:
+      aws-region: ${{ vars.AWS_REGION }}
+      aws-role-to-assume: ${{ vars.AWS_ECR_RELEASE_ROLE_ARN }}
+      ecr-quarantine-repository: echo-pong-quarantine
+      platforms: linux/amd64,linux/arm64
+      push-ghcr: true
+
+  scan-dev:
+    name: Scan (quarantine) — dev
+    needs: build-dev
+    uses: nevomenashe15-sketch/echo-pong-workflows/.github/workflows/image-scan.yml@v1
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      aws-region: ${{ vars.AWS_REGION }}
+      aws-role-to-assume: ${{ vars.AWS_ECR_RELEASE_ROLE_ARN }}
+      image-digest: ${{ needs.build-dev.outputs.image-digest }}
+      ecr-quarantine-repository: echo-pong-quarantine
+      severity: HIGH,CRITICAL
+
+  promote-dev:
+    name: Promote to production ECR — dev
+    needs: scan-dev
+    uses: nevomenashe15-sketch/echo-pong-workflows/.github/workflows/image-promote.yml@v1
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    with:
+      aws-region: ${{ vars.AWS_REGION }}
+      aws-role-to-assume: ${{ vars.AWS_ECR_RELEASE_ROLE_ARN }}
+      image-digest: ${{ needs.scan-dev.outputs.scanned-digest }}
+      source-repository: echo-pong-quarantine
+      target-repository: echo-pong
+      # No production-tag: this is not a human-facing release, only a dev
+      # deploy. It still lands in the one production ECR repo (see the
+      # header comment above for why) and is still signed + attested.
+
+  gitops-dev:
+    name: Propose + auto-merge GitOps update — dev
+    needs: promote-dev
+    uses: nevomenashe15-sketch/echo-pong-workflows/.github/workflows/gitops-propose-update.yml@v1
+    permissions:
+      contents: read
+    with:
+      gitops-repository: nevomenashe15-sketch/echo-pong-gitops
+      environment: dev
+      image-repository: ${{ needs.promote-dev.outputs.production-repository-uri }}
+      image-digest: ${{ needs.promote-dev.outputs.production-digest }}
+      chart-path: charts/echo-pong
+      use-github-app: true
+    secrets:
+      gitops-app-id: ${{ secrets.GITOPS_APP_ID }}
+      gitops-app-private-key: ${{ secrets.GITOPS_APP_PRIVATE_KEY }}
+
+  auto-merge-dev:
+    name: Auto-merge dev GitOps PR
+    needs: gitops-dev
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      # Independent token generation: gitops-propose-update.yml's own
+      # installation token is internal to that reusable workflow and isn't
+      # exposed as an output, by design (least privilege -- callers get a
+      # PR URL/number, not a live credential). Auto-merging is this
+      # repository's own policy choice for dev specifically, so it mints
+      # its own short-lived token from the same GitHub App installation
+      # rather than the reusable workflow growing an "auto-merge" input
+      # that every caller would inherit regardless of environment.
+      - name: Generate GitOps App token
+        id: app-token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1
+        with:
+          app-id: ${{ secrets.GITOPS_APP_ID }}
+          private-key: ${{ secrets.GITOPS_APP_PRIVATE_KEY }}
+          owner: nevomenashe15-sketch
+          repositories: echo-pong-gitops
+
+      - name: Enable auto-merge on the dev PR
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR_URL: ${{ needs.gitops-dev.outputs.pull-request-url }}
+        run: |
+          set -euo pipefail
+          # --auto respects echo-pong-gitops's own branch protection and
+          # required status checks -- it queues the merge, it does not
+          # force it. If required checks never pass, the PR simply never
+          # merges; nothing here bypasses review requirements that repo
+          # has configured.
+          gh pr merge --auto --squash "${PR_URL}"
+
   # ---------------------------------------------------------------------------
   # 2. Build the multi-arch image into QUARANTINE. Tags only -- PRs validate but
   #    never publish, so a fork PR can never push to any registry.
@@ -194,18 +326,40 @@ jobs:
 # PREREQUISITES in the calling repository
 #
 # Repository variables (vars.*) -- non-secret, but not hardcoded in YAML:
-#   AWS_REGION                  e.g. eu-west-1
+#   AWS_REGION                  e.g. eu-central-1 (matches echo-pong-infrastructure)
 #   AWS_ECR_RELEASE_ROLE_ARN    ARN of echo-pong-gh-ecr-release
 #
 # Repository secrets:
-#   GITOPS_APP_ID               GitHub App installed on echo-pong-gitops ONLY
-#   GITOPS_APP_PRIVATE_KEY      that App's private key (PEM)
+#   GITOPS_APP_ID               GitHub App installed on echo-pong-gitops ONLY.
+#   GITOPS_APP_PRIVATE_KEY      that App's private key (PEM). Used twice: by
+#                                gitops-propose-update.yml (dev and prod, to
+#                                open the PR) and directly by auto-merge-dev
+#                                (dev only, to enable auto-merge on it).
 #
 # Environments:
-#   production-promotion        required reviewers; gates step 4
+#   production-promotion        required reviewers; gates the tag-triggered
+#                                release chain's promotion to production.
+#                                The dev chain has no equivalent gate --
+#                                that absence is the point (see its header
+#                                comment) -- so double-check this Environment
+#                                is scoped to ONLY the `approve-promotion`
+#                                job, never accidentally to the dev jobs.
 #
 # AWS side (owned by echo-pong-infrastructure):
-#   echo-pong-gh-ecr-release must trust this repository's OIDC subject for the
-#   tag refs used above (e.g. repo:<owner>/echo-pong:ref:refs/tags/v*), with no
-#   wildcard repository trust.
+#   echo-pong-gh-ecr-release's OIDC trust policy must cover BOTH ref patterns
+#   used in this file, not just tags: refs/heads/main (the continuous dev
+#   chain) AND refs/tags/v* (the release chain) -- e.g.
+#   repo:<owner>/echo-pong:ref:refs/heads/main and
+#   repo:<owner>/echo-pong:ref:refs/tags/v*, with no wildcard repository
+#   trust either way. A role trusted for tags only will fail the dev chain's
+#   AssumeRoleWithWebIdentity call with an access-denied error, not a
+#   friendly one -- this is the first thing to check if build-dev fails at
+#   the "Configure AWS credentials" step.
+#
+# echo-pong-gitops side:
+#   auto-merge-dev's `gh pr merge --auto` only takes effect if that repo has
+#   branch protection with required status checks configured on its default
+#   branch -- without any required checks, GitHub merges the PR essentially
+#   immediately, which may or may not be the intended amount of ceremony for
+#   dev. This file doesn't and can't control that repo's own settings.
 # =============================================================================
