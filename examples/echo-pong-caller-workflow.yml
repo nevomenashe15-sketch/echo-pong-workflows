@@ -77,6 +77,13 @@ jobs:
   # not bypass echo-pong-gitops's own branch protection/required-checks,
   # it just removes the need for a human to manually press the button once
   # those pass.
+  #
+  # "Continuous" stops being accurate at the very last hop: once the PR
+  # merges, Argo CD itself still finds out by polling (no GitHub webhook --
+  # deliberately not built, see echo-pong-infrastructure/docs/architecture.md
+  # §10, since argocd-server has no public endpoint for GitHub to call by
+  # design). Expect up to ~3 minutes (`timeout.reconciliation`) between merge
+  # and the sync actually starting, not instant.
   # =============================================================================
   build-dev:
     name: Build (quarantine) — dev
