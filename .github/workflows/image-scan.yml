@@ -120,6 +120,19 @@ jobs:
           DIGEST: ${{ inputs.image-digest }}
         run: |
           set -euo pipefail
+          # Reject anything that is not a bare content digest before touching
+          # the registry -- same check image-promote.yml and
+          # gitops-propose-update.yml apply to this exact input. Without it,
+          # a caller that mis-wires the chain (e.g. passes a full `repo@sha256:...`
+          # ref here instead of the bare digest) produces a malformed
+          # double-ref that `crane manifest` fails on deep inside a later
+          # step with an opaque parse/lookup error, instead of a clear
+          # top-of-job validation message.
+          if ! printf '%s' "${DIGEST}" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+            echo "::error::image-digest must be a full sha256 content digest, got '${DIGEST}'."
+            exit 1
+          fi
+
           repo="${ECR_REGISTRY}/${REPO_NAME}"
           manifest="$(crane manifest "${repo}@${DIGEST}")"
 

@@ -88,6 +88,13 @@ jobs:
       aws-region: ${{ vars.AWS_REGION }}
       aws-role-to-assume: ${{ vars.AWS_ECR_RELEASE_ROLE_ARN }}
       image-digest: ${{ needs.build.outputs.image-digest }}
+      # Must match `build`'s ecr-quarantine-repository above -- this is set
+      # explicitly here rather than left to image-scan.yml's own default,
+      # because that default happening to equal build's value is a
+      # coincidence, not a guarantee: customizing build's value without also
+      # updating this one would make scan look up the digest in the wrong
+      # ECR repository. Setting both explicitly makes the coupling visible.
+      ecr-quarantine-repository: echo-pong-quarantine
       severity: HIGH,CRITICAL
 
   # ---------------------------------------------------------------------------

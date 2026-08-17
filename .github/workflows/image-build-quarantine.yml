@@ -169,9 +169,15 @@ jobs:
             echo "quarantine-repo=${quarantine_repo}"
             echo "ghcr-repo=${ghcr_repo}"
             echo "image-tag=${tag}"
-            echo "tags<<EOF"
+            # Random delimiter, not a literal "EOF": if tag_list ever
+            # contained a line that was exactly "EOF" (e.g. inputs.image-tag
+            # resolves to that string under some future misconfiguration),
+            # a fixed delimiter would prematurely terminate this heredoc and
+            # truncate/corrupt the tags output silently.
+            delim="ghadelim_${RANDOM}_${RANDOM}"
+            echo "tags<<${delim}"
             echo "${tag_list}"
-            echo "EOF"
+            echo "${delim}"
           } >> "$GITHUB_OUTPUT"
 
       - name: Derive OCI labels

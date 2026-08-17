@@ -105,7 +105,20 @@ jobs:
           if [ -f go.sum ]; then cp go.sum go.sum.orig; fi
           go mod tidy
           diff -u go.mod.orig go.mod
-          if [ -f go.sum.orig ]; then diff -u go.sum.orig go.sum; fi
+          if [ -f go.sum.orig ]; then
+            diff -u go.sum.orig go.sum
+          elif [ -f go.sum ]; then
+            # go.sum didn't exist before `go mod tidy` but exists after --
+            # a dependency was added to go.mod without running `go mod tidy`
+            # and committing the go.sum it produces. Without this branch, a
+            # caller with no committed go.sum (echo-pong currently has none,
+            # per its zero external dependencies) would silently pass this
+            # check even though a required go.sum was never committed: the
+            # `if [ -f go.sum.orig ]` diff above only fires when a go.sum
+            # already existed to diff against.
+            echo "::error::go mod tidy created a new go.sum that is not committed. Run 'go mod tidy' locally and commit go.sum." >&2
+            exit 1
+          fi
           rm -f go.mod.orig go.sum.orig
 
       - name: go vet

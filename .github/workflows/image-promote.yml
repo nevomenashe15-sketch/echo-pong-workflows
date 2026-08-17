@@ -74,7 +74,7 @@ on:
         description: "Production repository URI with no tag or digest."
         value: ${{ jobs.promote.outputs.production-repository-uri }}
       cosign-identity:
-        description: "Certificate identity recorded by Cosign; use verbatim in the Kyverno policy."
+        description: "Certificate identity recorded by Cosign; use verbatim in the Kyverno policy. EMPTY STRING when inputs.sign is false -- the identity step only runs if signing happened. Callers/consumers must not interpolate this output into a policy without checking it's non-empty first; a naive interpolation of an empty value can produce an invalid or overly permissive certificate-identity matcher."
         value: ${{ jobs.promote.outputs.cosign-identity }}
 
 permissions:
@@ -221,9 +221,21 @@ jobs:
           identity="$(printf '%s' "${verify_json}" \
             | jq -r '.[0].optional.Subject // .[0].optional.Issuer // empty')"
           if [ -z "${identity}" ]; then
-            identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/image-promote.yml@${GITHUB_REF}"
-            echo "::warning::Could not read the certificate subject from cosign output;" \
-                 "reporting the expected identity derived from the run context instead."
+            # No hand-rolled fallback here on purpose: the only value worth
+            # publishing into a Kyverno admission policy is the identity
+            # Fulcio actually issued. A previous version of this step
+            # fell back to a guessed URL built from GITHUB_REPOSITORY/
+            # GITHUB_REF -- those env vars resolve to the CALLER's repo/ref
+            # in a workflow_call run, not this workflow's, so the guess was
+            # silently wrong (exactly the mistake the file header above
+            # warns readers not to make). There is also no `github.*`
+            # expression that reliably names the reusable workflow actually
+            # executing this job (job_workflow_ref is an OIDC token claim,
+            # not a `github` context property -- confirmed via actionlint).
+            # Failing loudly is safer than publishing a plausible-looking
+            # but possibly-wrong identity into a security policy.
+            echo "::error::Could not read the certificate subject or issuer from cosign verify output. Refusing to guess an identity for the Kyverno policy -- investigate the cosign verify output above."
+            exit 1
           fi
           echo "cosign-identity=${identity}" >> "$GITHUB_OUTPUT"
 

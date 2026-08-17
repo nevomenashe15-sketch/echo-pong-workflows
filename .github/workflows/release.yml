@@ -1,14 +1,19 @@
 # Reusable binary release: cross-compiled Go binaries attached to a GitHub Release.
 #
 # Kept SEPARATE from image-build-quarantine.yml on purpose. The two produce
-# different artefacts for different consumers on different triggers: container
-# images are built on every qualifying commit and flow through the
-# quarantine/scan/promote pipeline into Kubernetes, whereas binaries are cut
-# only on a version tag and are consumed by humans and CI runners directly.
-# Folding them together would couple a tag-triggered human-facing release to a
-# commit-triggered deployment pipeline and force one to inherit the other's
-# permissions -- `contents: write` is needed here to publish a Release and is
-# exactly what the image path must never hold.
+# different artefacts for different consumers, and coupling them would force
+# one to inherit the other's permissions -- `contents: write` is needed here
+# to publish a Release and is exactly what the image path must never hold.
+#
+# Both are tag-gated in the documented example caller
+# (examples/echo-pong-caller-workflow.yml) today -- images do NOT currently
+# build on every commit to main, only on version tags, same cadence as
+# binaries. A continuous main-branch quarantine build (images built on every
+# commit, only PROMOTION gated to tags) is a real, separate design decision
+# with its own cost/security tradeoffs (a registry receiving pushes on every
+# commit) -- if adopted, give `build`/`scan` in the example a broader trigger
+# than `promote`/`binaries`/`gitops-propose-update`, rather than assuming it
+# from this comment alone.
 #
 # MATRIX: linux/amd64 and linux/arm64 mirror the container targets (and the
 # cluster's Graviton preference). darwin/arm64 is included because operators
@@ -202,11 +207,17 @@ jobs:
             echo "Verify:"
             echo '```bash'
             echo "sha256sum -c ${BINARY_NAME}_${VERSION}_checksums.txt"
-            echo "cosign verify-blob \\"
-            echo "  --certificate ${BINARY_NAME}_${VERSION}_checksums.txt.pem \\"
-            echo "  --signature ${BINARY_NAME}_${VERSION}_checksums.txt.sig \\"
-            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com \\"
-            echo "  --certificate-identity-regexp '.*/echo-pong-workflows/.github/workflows/release.yml@.*' \\"
-            echo "  ${BINARY_NAME}_${VERSION}_checksums.txt"
+            # .sig/.pem files are only produced (and only uploaded as release
+            # assets) when sign-checksums is true -- printing these
+            # instructions unconditionally would point a consumer at files
+            # that were never generated for an unsigned release.
+            if [ "${SIGNED}" = "true" ]; then
+              echo "cosign verify-blob \\"
+              echo "  --certificate ${BINARY_NAME}_${VERSION}_checksums.txt.pem \\"
+              echo "  --signature ${BINARY_NAME}_${VERSION}_checksums.txt.sig \\"
+              echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com \\"
+              echo "  --certificate-identity-regexp '.*/echo-pong-workflows/.github/workflows/release.yml@.*' \\"
+              echo "  ${BINARY_NAME}_${VERSION}_checksums.txt"
+            fi
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
